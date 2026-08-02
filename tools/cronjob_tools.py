@@ -294,7 +294,7 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
     return cleaned, ""
 
 
-def _origin_from_env() -> Optional[Dict[str, str]]:
+def _origin_from_env() -> Optional[Dict[str, Any]]:
     from gateway.session_context import get_session_env
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
     origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
@@ -316,6 +316,16 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # send_message, which passes HERMES_SESSION_USER_ID to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+        }
+    # Desktop is a durable local conversation, not a gateway messaging
+    # platform, so it has no platform/chat pair. Preserve its session-db id as
+    # the return address instead of silently downgrading deliver=origin to local.
+    origin_source = get_session_env("HERMES_SESSION_SOURCE").strip().lower()
+    origin_session_id = get_session_env("HERMES_SESSION_ID").strip()
+    if origin_source == "desktop" and origin_session_id:
+        return {
+            "platform": "desktop",
+            "session_id": origin_session_id,
         }
     return None
 

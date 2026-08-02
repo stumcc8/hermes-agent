@@ -93,6 +93,118 @@ def mirror_to_session(
         return False
 
 
+def desktop_session_exists(session_id: str) -> bool:
+    """Return whether an exact durable Desktop session exists."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return False
+
+    db = None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        return db.get_session(session_id) is not None
+    except Exception as e:
+        logger.debug("Desktop session lookup failed for %s: %s", session_id, e)
+        return False
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _notification_id_from_message(message: dict) -> Optional[int]:
+    metadata = message.get("display_metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    raw_id = metadata.get("cron_notification_id")
+    if raw_id is None:
+        return None
+    try:
+        return int(raw_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def append_desktop_cron_result(
+    session_id: str,
+    message_text: str,
+    *,
+    notification_id: int,
+    source_label: str = "cron",
+) -> bool:
+    """Append one idempotent, strict-alternation-safe Desktop cron result.
+
+    The Desktop poller calls this only while the runtime session is idle and
+    while holding its history lock. If the transcript currently ends in an
+    assistant (or is empty), a hidden user context row bridges to the new
+    assistant result. The queue row ID is persisted as display metadata so a
+    retry after an emit/ack crash cannot duplicate the transcript entry.
+    """
+    session_id = str(session_id or "").strip()
+    text = str(message_text or "").strip()
+    if not session_id or not text:
+        return False
+
+    db = None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        if db.get_session(session_id) is None:
+            return False
+
+        messages = db.get_messages(session_id)
+        if any(
+            message.get("role") == "assistant"
+            and _notification_id_from_message(message) == int(notification_id)
+            for message in messages
+        ):
+            return True
+
+        last_role = messages[-1].get("role") if messages else None
+        if last_role != "user":
+            db.append_message(
+                session_id=session_id,
+                role="user",
+                content=f"[Scheduled job completed: {source_label}]",
+                display_kind="hidden",
+                display_metadata={"cron_notification_id": int(notification_id)},
+            )
+        db.append_message(
+            session_id=session_id,
+            role="assistant",
+            content=text,
+            display_kind="cron_delivery",
+            display_metadata={
+                "cron_notification_id": int(notification_id),
+                "source": source_label,
+            },
+        )
+        logger.debug(
+            "Stored Desktop cron notification %s in session %s",
+            notification_id,
+            session_id,
+        )
+        return True
+    except Exception as e:
+        logger.debug(
+            "Desktop cron append failed for notification %s in session %s: %s",
+            notification_id,
+            session_id,
+            e,
+        )
+        return False
+    finally:
+        if db is not None:
+            db.close()
+
+
 def _find_session_id(
     platform: str,
     chat_id: str,

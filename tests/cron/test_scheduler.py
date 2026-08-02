@@ -123,6 +123,34 @@ class TestResolveDeliveryTarget:
             "thread_id": "17585",
         }
 
+    def test_desktop_origin_resolves_durable_session(self):
+        job = {
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "desktop",
+            "session_id": "desktop-session-123",
+        }
+
+    def test_bare_desktop_delivery_uses_durable_session(self):
+        job = {
+            "deliver": "desktop",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "desktop",
+            "session_id": "desktop-session-123",
+        }
+
 
     def test_bare_platform_delivery_uses_home_root_instead_of_origin_thread(self, monkeypatch):
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "home-parent")
@@ -243,6 +271,45 @@ class TestRoutingIntents:
         assert "signal" not in platforms
         assert "matrix" not in platforms
 
+    def test_desktop_origin_combines_with_all(self):
+        from cron.scheduler import _resolve_delivery_targets
+
+        job = {
+            "id": "desktop-fanout",
+            "deliver": "origin,all",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+        with (
+            patch(
+                "cron.scheduler._iter_home_target_platforms",
+                return_value=["telegram"],
+            ),
+            patch(
+                "cron.scheduler._get_home_target_chat_id",
+                return_value="-111",
+            ),
+            patch(
+                "cron.scheduler._get_home_target_thread_id",
+                return_value=None,
+            ),
+        ):
+            targets = _resolve_delivery_targets(job)
+
+        assert targets == [
+            {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+            {
+                "platform": "telegram",
+                "chat_id": "-111",
+                "thread_id": None,
+            },
+        ]
+
 
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
@@ -284,6 +351,70 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+
+    def test_desktop_origin_mirrors_without_platform_send(self):
+        job = {
+            "id": "desktop-cron",
+            "name": "desktop proof",
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+            "attach_to_session": True,
+        }
+
+        with (
+            patch(
+                "gateway.mirror.desktop_session_exists",
+                create=True,
+                return_value=True,
+            ) as exists_mock,
+            patch(
+                "cron.desktop_notifications.enqueue_desktop_notification",
+                return_value=7,
+            ) as enqueue_mock,
+            patch("gateway.config.load_gateway_config") as config_mock,
+            patch(
+                "tools.send_message_tool._send_to_platform",
+                new=AsyncMock(),
+            ) as send_mock,
+        ):
+            result = _deliver_result(job, "Synthetic desktop completion.")
+
+        assert result is None
+        exists_mock.assert_called_once_with("desktop-session-123")
+        enqueue_mock.assert_called_once_with(
+            "desktop-session-123",
+            "Synthetic desktop completion.",
+        )
+        config_mock.assert_not_called()
+        send_mock.assert_not_awaited()
+
+    def test_desktop_origin_reports_missing_session(self):
+        job = {
+            "id": "desktop-cron",
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "missing-session",
+            },
+        }
+
+        with (
+            patch(
+                "gateway.mirror.desktop_session_exists",
+                create=True,
+                return_value=False,
+            ),
+            patch(
+                "cron.desktop_notifications.enqueue_desktop_notification",
+            ) as enqueue_mock,
+        ):
+            result = _deliver_result(job, "Synthetic desktop completion.")
+
+        assert result == "desktop session 'missing-session' was not found"
+        enqueue_mock.assert_not_called()
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -489,6 +620,38 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_desktop_delivery_target_does_not_require_chat_id(self, tmp_path):
+        """Desktop cron targets route by session_id, never external chat_id."""
+        job = {
+            "id": "desktop-origin-job",
+            "name": "desktop origin",
+            "prompt": "hello",
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+
+        with self._run_job_patches(
+            tmp_path,
+            extra=(
+                patch(
+                    "cron.scheduler._resolve_delivery_target",
+                    return_value={
+                        "platform": "desktop",
+                        "session_id": "desktop-session-123",
+                    },
+                ),
+            ),
+        ) as (_, mock_agent_cls):
+            success, _, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        mock_agent_cls.assert_called_once()
 
 
     @contextlib.contextmanager
