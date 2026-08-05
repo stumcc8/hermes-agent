@@ -646,7 +646,7 @@ class TestDurableCursor:
         assert adapter._channel_state[CHANNEL]["seen"] == OrderedDict()
         assert adapter._channel_state[CHANNEL]["last_ts"] == 0
         assert not adapter._cursor_path.exists()
-        assert [call[4] for call in cli.calls] == ["2", "4"]
+        assert [call[0][5] for call in cli.calls] == ["2", "4"]
 
     @pytest.mark.asyncio
     async def test_full_startup_seed_expands_to_complete_window(self, monkeypatch, tmp_path):
@@ -672,7 +672,7 @@ class TestDurableCursor:
         assert seeded is True
         assert adapter._channel_state[CHANNEL]["last_ts"] == 30
         assert list(adapter._channel_state[CHANNEL]["seen"]) == ["e1", "e2", "e3"]
-        assert [call[4] for call in cli.calls] == ["2", "4"]
+        assert [call[0][5] for call in cli.calls] == ["2", "4"]
 
     @pytest.mark.asyncio
     async def test_failed_startup_dm_seed_fails_discovery(self):
