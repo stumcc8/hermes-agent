@@ -961,7 +961,7 @@ class TestDurableCursor:
 
         assert adapter._channel_state[CHANNEL]["recovering"] is False
         assert "catchup_before" not in adapter._channel_state[CHANNEL]
-        saved = json.loads(adapter._cursor_path.read_text())
+        saved = json.loads(adapter._cursor_path.read_text(encoding="utf-8"))
         assert saved["channels"][CHANNEL]["last_ts"] == 10
 
     def test_observer_mode_forces_proven_poll_transport(self):
