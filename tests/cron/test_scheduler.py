@@ -123,6 +123,34 @@ class TestResolveDeliveryTarget:
             "thread_id": "17585",
         }
 
+    def test_desktop_origin_resolves_durable_session(self):
+        job = {
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "desktop",
+            "session_id": "desktop-session-123",
+        }
+
+    def test_bare_desktop_delivery_uses_durable_session(self):
+        job = {
+            "deliver": "desktop",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "desktop",
+            "session_id": "desktop-session-123",
+        }
+
 
     def test_bare_platform_delivery_uses_home_root_instead_of_origin_thread(self, monkeypatch):
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "home-parent")
@@ -243,6 +271,45 @@ class TestRoutingIntents:
         assert "signal" not in platforms
         assert "matrix" not in platforms
 
+    def test_desktop_origin_combines_with_all(self):
+        from cron.scheduler import _resolve_delivery_targets
+
+        job = {
+            "id": "desktop-fanout",
+            "deliver": "origin,all",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+        with (
+            patch(
+                "cron.scheduler._iter_home_target_platforms",
+                return_value=["telegram"],
+            ),
+            patch(
+                "cron.scheduler._get_home_target_chat_id",
+                return_value="-111",
+            ),
+            patch(
+                "cron.scheduler._get_home_target_thread_id",
+                return_value=None,
+            ),
+        ):
+            targets = _resolve_delivery_targets(job)
+
+        assert targets == [
+            {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+            {
+                "platform": "telegram",
+                "chat_id": "-111",
+                "thread_id": None,
+            },
+        ]
+
 
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
@@ -284,6 +351,70 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+
+    def test_desktop_origin_mirrors_without_platform_send(self):
+        job = {
+            "id": "desktop-cron",
+            "name": "desktop proof",
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+            "attach_to_session": True,
+        }
+
+        with (
+            patch(
+                "gateway.mirror.desktop_session_exists",
+                create=True,
+                return_value=True,
+            ) as exists_mock,
+            patch(
+                "cron.desktop_notifications.enqueue_desktop_notification",
+                return_value=7,
+            ) as enqueue_mock,
+            patch("gateway.config.load_gateway_config") as config_mock,
+            patch(
+                "tools.send_message_tool._send_to_platform",
+                new=AsyncMock(),
+            ) as send_mock,
+        ):
+            result = _deliver_result(job, "Synthetic desktop completion.")
+
+        assert result is None
+        exists_mock.assert_called_once_with("desktop-session-123")
+        enqueue_mock.assert_called_once_with(
+            "desktop-session-123",
+            "Synthetic desktop completion.",
+        )
+        config_mock.assert_not_called()
+        send_mock.assert_not_awaited()
+
+    def test_desktop_origin_reports_missing_session(self):
+        job = {
+            "id": "desktop-cron",
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "missing-session",
+            },
+        }
+
+        with (
+            patch(
+                "gateway.mirror.desktop_session_exists",
+                create=True,
+                return_value=False,
+            ),
+            patch(
+                "cron.desktop_notifications.enqueue_desktop_notification",
+            ) as enqueue_mock,
+        ):
+            result = _deliver_result(job, "Synthetic desktop completion.")
+
+        assert result == "desktop session 'missing-session' was not found"
+        enqueue_mock.assert_not_called()
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -490,6 +621,38 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_desktop_delivery_target_does_not_require_chat_id(self, tmp_path):
+        """Desktop cron targets route by session_id, never external chat_id."""
+        job = {
+            "id": "desktop-origin-job",
+            "name": "desktop origin",
+            "prompt": "hello",
+            "deliver": "origin",
+            "origin": {
+                "platform": "desktop",
+                "session_id": "desktop-session-123",
+            },
+        }
+
+        with self._run_job_patches(
+            tmp_path,
+            extra=(
+                patch(
+                    "cron.scheduler._resolve_delivery_target",
+                    return_value={
+                        "platform": "desktop",
+                        "session_id": "desktop-session-123",
+                    },
+                ),
+            ),
+        ) as (_, mock_agent_cls):
+            success, _, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        mock_agent_cls.assert_called_once()
+
 
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
@@ -559,7 +722,7 @@ class TestRunJobConfigLogging:
     def test_bad_config_yaml_is_logged(self, caplog, tmp_path):
         """When config.yaml is malformed, a warning should be logged."""
         bad_yaml = tmp_path / "config.yaml"
-        bad_yaml.write_text("invalid: yaml: [[[bad")
+        bad_yaml.write_text("invalid: yaml: [[[bad", encoding="utf-8")
 
         job = {
             "id": "test-job",
@@ -605,7 +768,9 @@ class TestRunJobConfigEnvVarExpansion:
 
     def test_model_env_ref_in_config_yaml_is_expanded(self, tmp_path, monkeypatch):
         """${VAR} in config.yaml model: is expanded using env after .env is loaded."""
-        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_MODEL}\n")
+        (tmp_path / "config.yaml").write_text(
+            "model: ${_HERMES_TEST_CRON_MODEL}\n", encoding="utf-8"
+        )
         monkeypatch.setenv("_HERMES_TEST_CRON_MODEL", "gpt-4o-mini-cron-test")
 
         job = {"id": "env-job", "name": "env test", "prompt": "hi"}
@@ -691,7 +856,9 @@ class TestRunJobConfigEnvVarExpansion:
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
-        (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
+        (tmp_path / "config.yaml").write_text(
+            "model: ${_HERMES_TEST_CRON_UNSET_VAR}\n", encoding="utf-8"
+        )
         monkeypatch.delenv("_HERMES_TEST_CRON_UNSET_VAR", raising=False)
 
         job = {"id": "unset-job", "name": "unset var test", "prompt": "hi"}
@@ -736,7 +903,7 @@ class TestRunJobModelResolution:
 
     def test_null_job_model_falls_back_to_env(self, tmp_path, monkeypatch):
         """``model: null`` on the job uses HERMES_MODEL when set."""
-        (tmp_path / "config.yaml").write_text("")
+        (tmp_path / "config.yaml").write_text("", encoding="utf-8")
         monkeypatch.setenv("HERMES_MODEL", "env-model")
 
         job = {"id": "null-model-job", "name": "null model", "prompt": "hi", "model": None}
@@ -762,7 +929,7 @@ class TestRunJobModelResolution:
 
     def test_no_model_anywhere_fails_with_actionable_error(self, tmp_path, monkeypatch):
         """All three sources empty → fail fast with a clear message, not an opaque 400."""
-        (tmp_path / "config.yaml").write_text("")
+        (tmp_path / "config.yaml").write_text("", encoding="utf-8")
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
         job = {"id": "no-model-job", "name": "no model anywhere", "prompt": "hi", "model": None}
@@ -794,7 +961,9 @@ class TestRunJobModelResolution:
         resolver mirrors that so a config that works in the CLI also works in
         cron.
         """
-        (tmp_path / "config.yaml").write_text("model:\n  model: alias-key-model\n")
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  model: alias-key-model\n", encoding="utf-8"
+        )
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
         job = {"id": "alias-job", "name": "alias", "prompt": "hi", "model": None}
@@ -819,7 +988,9 @@ class TestRunJobModelResolution:
 
     def test_corrupt_config_yaml_does_not_crash_with_job_model(self, tmp_path, monkeypatch):
         """A malformed config.yaml degrades gracefully when the job has a model."""
-        (tmp_path / "config.yaml").write_text("{{{invalid yaml!!!")
+        (tmp_path / "config.yaml").write_text(
+            "{{{invalid yaml!!!", encoding="utf-8"
+        )
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
         job = {"id": "corrupt-job", "name": "corrupt", "prompt": "hi", "model": "explicit-model"}
@@ -1120,7 +1291,9 @@ class TestBuildJobPromptAbsoluteSkillPath:
         skills_dir = tmp_path / "skills"
         skill_dir = skills_dir / "alpha-skill"
         skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text("# Alpha\nDo alpha.")
+        (skill_dir / "SKILL.md").write_text(
+            "# Alpha\nDo alpha.", encoding="utf-8"
+        )
         absolute_path = str(skill_dir)
         seen_names: list[str] = []
 

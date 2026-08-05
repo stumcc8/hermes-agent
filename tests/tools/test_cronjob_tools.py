@@ -490,6 +490,34 @@ class TestLocalDeliveryNotice:
         assert created["deliver"] == "origin"
         assert "local-only cron job" not in created["message"]
 
+    def test_desktop_origin_captures_durable_session(self):
+        """Desktop cron jobs return to the durable conversation, not local output."""
+        from cron.jobs import get_job
+        from gateway.session_context import set_session_vars
+
+        set_session_vars(
+            source="desktop",
+            session_id="desktop-session-123",
+            ui_session_id="desktop-window-456",
+        )
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Report the synthetic check result",
+                schedule="every 2m",
+                attach_to_session=True,
+            )
+        )
+
+        stored = get_job(created["job_id"])
+        assert created["deliver"] == "origin"
+        assert stored["origin"] == {
+            "platform": "desktop",
+            "session_id": "desktop-session-123",
+        }
+        assert "local-only cron job" not in created["message"]
+
 
 class TestValidateCronBaseUrl:
     """The cron base_url guard must not let a NAMED custom provider's stored
