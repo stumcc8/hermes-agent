@@ -615,7 +615,7 @@ class TestDurableCursor:
         assert not adapter._cursor_path.exists()
 
     @pytest.mark.asyncio
-    async def test_full_startup_seed_expands_then_fails_closed_at_ceiling(
+    async def test_full_startup_seed_uses_newest_events_at_ceiling(
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setattr(_buzz_mod, "_FETCH_LIMIT", 2)
@@ -642,10 +642,15 @@ class TestDurableCursor:
 
         seeded = await adapter._seed_channel(CHANNEL, chat_type="group")
 
-        assert seeded is False
-        assert adapter._channel_state[CHANNEL]["seen"] == OrderedDict()
-        assert adapter._channel_state[CHANNEL]["last_ts"] == 0
-        assert not adapter._cursor_path.exists()
+        assert seeded is True
+        assert list(adapter._channel_state[CHANNEL]["seen"]) == [
+            "e1",
+            "e2",
+            "e3",
+            "e4",
+        ]
+        assert adapter._channel_state[CHANNEL]["last_ts"] == 40
+        assert adapter._cursor_path.exists()
         assert [call[0][5] for call in cli.calls] == ["2", "4"]
 
     @pytest.mark.asyncio

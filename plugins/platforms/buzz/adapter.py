@@ -1060,13 +1060,16 @@ class BuzzAdapter(BasePlatformAdapter):
             if len(events) < limit:
                 break
             if limit >= _MAX_FETCH_LIMIT:
-                logger.error(
-                    "Buzz: refusing a full startup window of %d events for %s because "
-                    "timestamp-only pagination cannot prove the baseline is complete",
-                    limit,
+                # A first seed intentionally skips history. Buzz returns the
+                # newest events for a limited fetch, so the latest timestamp is
+                # still a safe baseline even when total history exceeds the
+                # bounded window.
+                logger.info(
+                    "Buzz: seeding %s from the newest %d events at the startup ceiling",
                     channel_id,
+                    limit,
                 )
-                return False
+                break
             limit = min(limit * 2, _MAX_FETCH_LIMIT)
         for event in events:
             event_id = event.get("id")
