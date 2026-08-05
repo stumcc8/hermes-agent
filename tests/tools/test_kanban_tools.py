@@ -810,6 +810,41 @@ def _sub_index(subs):
     return out
 
 
+def test_create_does_not_accept_model_controlled_session_id(worker_env):
+    """Raw tool arguments must not override the trusted request origin."""
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    reset_session_vars()
+    set_session_vars(
+        platform="api_server",
+        chat_id="trusted-origin-session",
+        session_id="worker-internal-session",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "origin-bound child",
+            "assignee": "peer",
+            # The registry forwards unknown raw arguments to handlers. Treat
+            # this field as attacker-controlled even though it is not in the
+            # public kanban_create schema.
+            "session_id": "attacker-selected-session",
+        })
+    finally:
+        reset_session_vars()
+
+    result = json.loads(out)
+    assert result["ok"] is True
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, result["task_id"])
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.session_id == "trusted-origin-session"
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

@@ -1239,10 +1239,11 @@ def _handle_create(args: dict, **kw) -> str:
     # would stamp — and later wake — the wrong session.
     from tools.async_delegation import _current_origin_session_id
 
-    session_id = (
-        args.get("session_id")
-        or _current_origin_session_id()
-        or os.environ.get("HERMES_SESSION_ID")
+    # Never accept a session id from raw tool arguments. The registry passes
+    # unknown fields through to handlers, so a model-controlled override could
+    # bind completion delivery to an unrelated durable session.
+    session_id = _current_origin_session_id() or os.environ.get(
+        "HERMES_SESSION_ID"
     )
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
