@@ -457,12 +457,13 @@ class TestDurableCursor:
         assert saved["channels"][CHANNEL]["seen"] == ["e1"]
 
     @pytest.mark.asyncio
-    async def test_recovered_message_commits_without_dispatch(self):
+    async def test_recovered_message_dispatches_as_silent_catchup(self):
         adapter = _make_adapter({"observer_mode": True, "response_authority": True})
         adapter._dispatched = []
 
         async def capture(**kwargs):
             adapter._dispatched.append(kwargs)
+            return True
 
         adapter._dispatch_message = capture
         handler = AsyncMock()
@@ -471,6 +472,7 @@ class TestDurableCursor:
             "chat_type": "group",
             "last_ts": 200,
             "seen": OrderedDict(),
+            "pending": set(),
             "recovering": True,
             "catchup_before": 1000,
         }
@@ -482,10 +484,13 @@ class TestDurableCursor:
             _event("e2", content="@Chip old request", created_at=250),
         )
 
-        assert adapter._dispatched == []
+        assert len(adapter._dispatched) == 1
+        assert adapter._dispatched[0]["catchup"] is True
+        assert adapter._dispatched[0]["acknowledge"] is False
         handler.assert_not_awaited()
-        assert state["last_ts"] == 250
-        assert "e2" in state["seen"]
+        assert state["last_ts"] == 200
+        assert "e2" not in state["seen"]
+        assert state["pending"] == {"e2"}
 
     @pytest.mark.asyncio
     async def test_observer_event_carries_silence_policy_and_catchup_marker(self):
@@ -610,8 +615,11 @@ class TestDurableCursor:
         assert not adapter._cursor_path.exists()
 
     @pytest.mark.asyncio
-    async def test_full_startup_seed_page_fails_closed(self, monkeypatch, tmp_path):
+    async def test_full_startup_seed_expands_then_fails_closed_at_ceiling(
+        self, monkeypatch, tmp_path
+    ):
         monkeypatch.setattr(_buzz_mod, "_FETCH_LIMIT", 2)
+        monkeypatch.setattr(_buzz_mod, "_MAX_FETCH_LIMIT", 4)
         adapter = _make_adapter({"observer_mode": True})
         adapter._cursor_path = tmp_path / "cursor.json"
         cli = _ScriptedCli()
@@ -619,6 +627,16 @@ class TestDurableCursor:
             "messages",
             "get",
             [_event("e1", created_at=10), _event("e2", created_at=20)],
+        )
+        cli.script(
+            "messages",
+            "get",
+            [
+                _event("e1", created_at=10),
+                _event("e2", created_at=20),
+                _event("e3", created_at=30),
+                _event("e4", created_at=40),
+            ],
         )
         adapter._run_cli = cli
 
@@ -628,6 +646,33 @@ class TestDurableCursor:
         assert adapter._channel_state[CHANNEL]["seen"] == OrderedDict()
         assert adapter._channel_state[CHANNEL]["last_ts"] == 0
         assert not adapter._cursor_path.exists()
+        assert [call[4] for call in cli.calls] == ["2", "4"]
+
+    @pytest.mark.asyncio
+    async def test_full_startup_seed_expands_to_complete_window(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(_buzz_mod, "_FETCH_LIMIT", 2)
+        monkeypatch.setattr(_buzz_mod, "_MAX_FETCH_LIMIT", 4)
+        adapter = _make_adapter({"observer_mode": True})
+        adapter._cursor_path = tmp_path / "cursor.json"
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [_event("e2", created_at=20), _event("e3", created_at=30)])
+        cli.script(
+            "messages",
+            "get",
+            [
+                _event("e1", created_at=10),
+                _event("e2", created_at=20),
+                _event("e3", created_at=30),
+            ],
+        )
+        adapter._run_cli = cli
+
+        seeded = await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        assert seeded is True
+        assert adapter._channel_state[CHANNEL]["last_ts"] == 30
+        assert list(adapter._channel_state[CHANNEL]["seen"]) == ["e1", "e2", "e3"]
+        assert [call[4] for call in cli.calls] == ["2", "4"]
 
     @pytest.mark.asyncio
     async def test_failed_startup_dm_seed_fails_discovery(self):
@@ -662,6 +707,7 @@ class TestDurableCursor:
     @pytest.mark.asyncio
     async def test_ambiguous_full_timestamp_page_fails_without_dispatch_or_cursor_advance(self, monkeypatch):
         monkeypatch.setattr(_buzz_mod, "_FETCH_LIMIT", 2)
+        monkeypatch.setattr(_buzz_mod, "_MAX_FETCH_LIMIT", 4)
         adapter = _make_adapter({"observer_mode": True})
         adapter._dispatched = []
 
@@ -681,7 +727,12 @@ class TestDurableCursor:
             _event("e1", content="first", created_at=10),
             _event("e2", content="second", created_at=10),
         ])
-        cli.script("messages", "get", [])
+        cli.script("messages", "get", [
+            _event("e1", content="first", created_at=10),
+            _event("e2", content="second", created_at=10),
+            _event("e3", content="third", created_at=10),
+            _event("e4", content="fourth", created_at=10),
+        ])
         adapter._run_cli = cli
 
         await adapter._poll_channel(CHANNEL)
@@ -920,8 +971,8 @@ class TestDurableCursor:
         assert adapter._channel_state[CHANNEL]["pending"] == {"e1"}
 
     @pytest.mark.asyncio
-    async def test_catchup_response_is_deterministically_suppressed(self, tmp_path):
-        adapter = _make_adapter({"observer_mode": True})
+    async def test_catchup_dispatches_without_acknowledgement(self, tmp_path):
+        adapter = _make_adapter({"observer_mode": True, "response_authority": True})
         adapter._cursor_path = tmp_path / "cursor.json"
         adapter._channel_state[CHANNEL] = {
             "chat_type": "group",
@@ -931,15 +982,18 @@ class TestDurableCursor:
             "recovering": True,
             "catchup_before": 100,
         }
-        adapter.set_message_handler(AsyncMock(return_value="stale intervention"))
-        adapter.send = AsyncMock(return_value=_buzz_mod.SendResult(success=True, message_id="out1"))
+        adapter._dispatch_message = AsyncMock(return_value=True)
 
         await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], _event("e1", created_at=10))
-        await asyncio.gather(*list(adapter._background_tasks))
 
-        adapter.send.assert_not_awaited()
-        assert adapter._channel_state[CHANNEL]["last_ts"] == 10
-        assert "e1" in adapter._channel_state[CHANNEL]["seen"]
+        adapter._dispatch_message.assert_awaited_once()
+        assert adapter._dispatch_message.await_args is not None
+        kwargs = adapter._dispatch_message.await_args.kwargs
+        assert kwargs["catchup"] is True
+        assert kwargs["acknowledge"] is False
+        assert adapter._channel_state[CHANNEL]["last_ts"] == 5
+        assert "e1" not in adapter._channel_state[CHANNEL]["seen"]
+        assert adapter._channel_state[CHANNEL]["pending"] == {"e1"}
 
     @pytest.mark.asyncio
     async def test_recovery_ends_after_poll_with_only_seen_boundary(self, tmp_path):

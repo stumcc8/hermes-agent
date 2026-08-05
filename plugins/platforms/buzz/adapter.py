@@ -1038,28 +1038,36 @@ class BuzzAdapter(BasePlatformAdapter):
             "recovering": False,
         }
         self._channel_state[channel_id] = state
-        code, out, err = await self._run_cli(
-            ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        )
-        if code != 0:
-            logger.warning(
-                "Buzz: could not seed channel %s — %s", channel_id, _cli_error_message(err, code)
+        limit = _FETCH_LIMIT
+        while True:
+            code, out, err = await self._run_cli(
+                ["messages", "get", "--channel", channel_id, "--limit", str(limit)]
             )
-            # Fail closed. Advancing to "now" after an unreadable seed would
-            # permanently skip every message in the unknown interval.
-            return False
-        try:
-            events = _parse_json_list_strict(out)
-        except ValueError as exc:
-            logger.warning("Buzz: invalid seed response for channel %s — %s", channel_id, exc)
-            return False
-        if len(events) >= _FETCH_LIMIT:
-            logger.error(
-                "Buzz: refusing a full startup page for %s because timestamp-only "
-                "pagination cannot prove the baseline is complete",
-                channel_id,
-            )
-            return False
+            if code != 0:
+                logger.warning(
+                    "Buzz: could not seed channel %s — %s",
+                    channel_id,
+                    _cli_error_message(err, code),
+                )
+                # Fail closed. Advancing to "now" after an unreadable seed would
+                # permanently skip every message in the unknown interval.
+                return False
+            try:
+                events = _parse_json_list_strict(out)
+            except ValueError as exc:
+                logger.warning("Buzz: invalid seed response for channel %s — %s", channel_id, exc)
+                return False
+            if len(events) < limit:
+                break
+            if limit >= _MAX_FETCH_LIMIT:
+                logger.error(
+                    "Buzz: refusing a full startup window of %d events for %s because "
+                    "timestamp-only pagination cannot prove the baseline is complete",
+                    limit,
+                    channel_id,
+                )
+                return False
+            limit = min(limit * 2, _MAX_FETCH_LIMIT)
         for event in events:
             event_id = event.get("id")
             created_at = int(event.get("created_at") or 0)
@@ -1285,24 +1293,21 @@ class BuzzAdapter(BasePlatformAdapter):
         self._trim_seen(state)
 
     async def _fetch_channel_events(self, channel_id: str, state: dict) -> Optional[List[dict]]:
-        """Fetch every event after the cursor, including multi-page backlogs.
+        """Fetch every event after the cursor within a bounded complete window.
 
-        Buzz returns the newest window in a requested time range. Walk
-        backwards with ``--before`` until the range is exhausted, then restore
-        chronological order before dispatching. If any page fails, discard the
-        batch so the durable cursor cannot jump over missing events.
+        Buzz's timestamp boundary is inclusive but cannot safely split events
+        sharing one timestamp. Expand the same requested window until the relay
+        returns fewer rows than requested. If the bounded ceiling is still
+        full, fail closed so the durable cursor cannot jump over missing events.
         """
         since = max(0, int(state.get("last_ts") or 0))
-        before: Optional[int] = None
-        by_id: Dict[str, dict] = {}
+        limit = _FETCH_LIMIT
         while True:
-            args = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
+            args = ["messages", "get", "--channel", channel_id, "--limit", str(limit)]
             if since:
                 # Nostr `since` is inclusive: same-second events are re-fetched
                 # and de-duped by id during dispatch.
                 args += ["--since", str(since)]
-            if before is not None:
-                args += ["--before", str(before)]
             code, out, err = await self._run_cli(args)
             if code != 0:
                 logger.debug(
@@ -1320,20 +1325,23 @@ class BuzzAdapter(BasePlatformAdapter):
             except ValueError as exc:
                 logger.error("Buzz: invalid poll response for %s — %s", channel_id, exc)
                 return None
-            for event in page:
-                event_id = str(event.get("id") or "")
-                if event_id:
-                    by_id[event_id] = event
-            if len(page) < _FETCH_LIMIT:
+            if len(page) < limit:
                 break
-            logger.error(
-                "Buzz: refusing a full page for %s because timestamp-only pagination "
-                "cannot prove the boundary is complete",
-                channel_id,
-            )
-            return None
+            if limit >= _MAX_FETCH_LIMIT:
+                logger.error(
+                    "Buzz: refusing a full window of %d events for %s because "
+                    "timestamp-only pagination cannot prove the boundary is complete",
+                    limit,
+                    channel_id,
+                )
+                return None
+            limit = min(limit * 2, _MAX_FETCH_LIMIT)
         return sorted(
-            by_id.values(),
+            {
+                str(event.get("id")): event
+                for event in page
+                if event.get("id")
+            }.values(),
             key=lambda event: (int(event.get("created_at") or 0), str(event.get("id") or "")),
         )
 
@@ -1397,11 +1405,11 @@ class BuzzAdapter(BasePlatformAdapter):
         catchup_before = int(state.get("catchup_before") or 0)
         is_catchup = bool(state.get("recovering") and catchup_before and created_at <= catchup_before)
 
-        # Private observation and outage recovery are transport/context probes,
-        # not agent turns. Commit them without invoking the handler at all:
-        # post-handler response filtering cannot contain streaming, tools,
-        # command replies, media, error notices, or other outbound side effects.
-        if self.observer_mode and (not self.response_authority or is_catchup):
+        # A non-authoritative observer is a transport-only probe and must never
+        # invoke the agent. Authoritative observers do receive outage catch-up
+        # turns, marked below so the channel prompt forbids stale action and
+        # outbound acknowledgement remains disabled.
+        if self.observer_mode and not self.response_authority:
             self._commit_event(channel_id, event_id, created_at)
             return False
 
