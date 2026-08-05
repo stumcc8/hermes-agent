@@ -8840,6 +8840,7 @@ _KANBAN_NOTIFY_KINDS = (
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
+_DESKTOP_CRON_POLL_SECONDS = 5.0
 
 
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
@@ -8997,6 +8998,80 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _dispatch_desktop_cron_notifications(sid: str, session: dict) -> int:
+    """Surface durable cron completions in their exact Desktop session.
+
+    This function claims the durable result, persists it while holding the
+    idle session's history lock, emits a native assistant completion frame,
+    then acknowledges the wake. Busy sessions leave rows untouched so a cron
+    completion cannot terminate an active streaming turn.
+    """
+    from cron.desktop_notifications import (
+        acknowledge_desktop_notification,
+        claim_desktop_notifications,
+        release_desktop_notification,
+    )
+    from gateway.mirror import append_desktop_cron_result
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    if session.get("_finalized"):
+        return 0
+
+    history_lock = session["history_lock"]
+    history_lock.acquire()
+    claim_token = f"{os.getpid()}:{sid}"
+    profile_token = None
+    try:
+        if session.get("running") or session.get("_finalized"):
+            return 0
+        agent = session.get("agent")
+        session_id = str(
+            getattr(agent, "session_id", None)
+            or session.get("session_key")
+            or ""
+        ).strip()
+        if not session_id:
+            return 0
+
+        profile_home = str(session.get("profile_home") or "").strip()
+        if profile_home:
+            profile_token = set_hermes_home_override(profile_home)
+        rows = claim_desktop_notifications(session_id, claim_token)
+        delivered = 0
+        for row in rows:
+            notification_id = int(row["id"])
+            if not append_desktop_cron_result(
+                session_id,
+                str(row.get("content") or ""),
+                notification_id=notification_id,
+            ):
+                release_desktop_notification(notification_id, claim_token)
+                continue
+            try:
+                _emit(
+                    "message.complete",
+                    sid,
+                    {
+                        "text": str(row.get("content") or ""),
+                        "usage": {},
+                        "status": "completed",
+                    },
+                )
+            except Exception:
+                release_desktop_notification(notification_id, claim_token)
+                continue
+            if acknowledge_desktop_notification(notification_id, claim_token):
+                delivered += 1
+        return delivered
+    finally:
+        if profile_token is not None:
+            reset_hermes_home_override(profile_token)
+        history_lock.release()
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -9019,8 +9094,19 @@ def _notification_poller_loop(
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
+    _last_desktop_cron_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
+        if _now - _last_desktop_cron_poll >= _DESKTOP_CRON_POLL_SECONDS:
+            _last_desktop_cron_poll = _now
+            try:
+                _dispatch_desktop_cron_notifications(sid, session)
+            except Exception as _cron_exc:
+                print(
+                    f"[tui_gateway] desktop cron notification poll failed: "
+                    f"{type(_cron_exc).__name__}",
+                    file=sys.stderr,
+                )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
             try:

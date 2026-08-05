@@ -611,6 +611,11 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     chat_id = origin.get("chat_id")
     if platform and chat_id:
         return origin
+    if (
+        str(platform or "").lower() == "desktop"
+        and str(origin.get("session_id") or "").strip()
+    ):
+        return origin
     return None
 
 
@@ -1146,6 +1151,14 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
+            if str(origin.get("platform") or "").lower() == "desktop":
+                session_id = str(origin.get("session_id") or "").strip()
+                if session_id:
+                    return {
+                        "platform": "desktop",
+                        "session_id": session_id,
+                    }
+                return None
             return {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
@@ -1213,6 +1226,14 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     platform_name = deliver_value
     if origin and origin.get("platform") == platform_name:
+        if str(platform_name).lower() == "desktop":
+            session_id = str(origin.get("session_id") or "").strip()
+            if session_id:
+                return {
+                    "platform": "desktop",
+                    "session_id": session_id,
+                }
+            return None
         chat_id = _get_home_target_chat_id(platform_name)
         if chat_id:
             return {
@@ -1310,7 +1331,11 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     for part in parts:
         target = _resolve_single_delivery_target(job, part)
         if target:
-            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
+            key = (
+                target["platform"].lower(),
+                str(target.get("chat_id") or target.get("session_id") or ""),
+                target.get("thread_id"),
+            )
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
@@ -1495,6 +1520,43 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
 
+    # Desktop is a durable local session, not a messaging adapter. Queue the
+    # raw final response for its exact runtime poller; that poller persists and
+    # emits it only while the session is idle, preserving strict alternation.
+    from cron.desktop_notifications import enqueue_desktop_notification
+    from gateway.mirror import desktop_session_exists
+
+    delivery_errors = []
+    adapter_targets = []
+    for target in targets:
+        if str(target.get("platform") or "").lower() != "desktop":
+            adapter_targets.append(target)
+            continue
+        session_id = str(target.get("session_id") or "").strip()
+        if not session_id or not desktop_session_exists(session_id):
+            msg = f"desktop session '{session_id}' was not found"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            delivery_errors.append(msg)
+        else:
+            try:
+                enqueue_desktop_notification(session_id, content)
+            except Exception as exc:
+                msg = (
+                    f"desktop wake enqueue failed for session '{session_id}': "
+                    f"{type(exc).__name__}"
+                )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                delivery_errors.append(msg)
+            else:
+                logger.info(
+                    "Job '%s': delivered to desktop session %s",
+                    job.get("id", "?"),
+                    session_id,
+                )
+    targets = adapter_targets
+    if not targets:
+        return "; ".join(delivery_errors) if delivery_errors else None
+
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
@@ -1546,8 +1608,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         msg = f"failed to load gateway config: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
-
-    delivery_errors = []
 
     for target in targets:
         platform_name = target["platform"]
@@ -3180,7 +3240,11 @@ def run_job(
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+            # External adapters route by chat_id; Desktop is a local origin and
+            # routes by durable session_id through the mirror/notification path.
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(
+                str(delivery_target.get("chat_id") or "")
+            )
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
                 ""
                 if delivery_target.get("thread_id") is None
